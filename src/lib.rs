@@ -4,14 +4,14 @@ use zellij_tile::prelude::*;
 
 // === Configuration Enums ===
 
-#[derive(Default, PartialEq)]
+#[derive(Default, Debug, PartialEq)]
 enum Source {
     #[default]
     Cwd,
     Process,
 }
 
-#[derive(Default, PartialEq)]
+#[derive(Default, Debug, PartialEq)]
 enum Format {
     #[default]
     Basename,
@@ -20,7 +20,7 @@ enum Format {
     Segments(usize),
 }
 
-#[derive(Default, PartialEq)]
+#[derive(Default, Debug, PartialEq)]
 enum TruncateSide {
     Left,
     #[default]
@@ -307,14 +307,12 @@ impl State {
         let components: Vec<_> = path.components().collect();
         let start = components.len().saturating_sub(n);
 
-        let mut result = String::new();
-        for (i, comp) in components[start..].iter().enumerate() {
-            if i > 0 {
-                result.push('/');
-            }
-            result.push_str(&comp.as_os_str().to_string_lossy());
-        }
-        result
+        // Use PathBuf's FromIterator to handle path separators correctly
+        components[start..]
+            .iter()
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .to_string()
     }
 
     fn truncate_if_needed(&self, s: &str) -> String {
@@ -362,5 +360,318 @@ impl State {
             self.current_tab_names
                 .insert(tab_position, new_name.to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    // === Helper functions ===
+
+    fn make_config(entries: &[(&str, &str)]) -> Config {
+        let mut map = BTreeMap::new();
+        for (k, v) in entries {
+            map.insert(k.to_string(), v.to_string());
+        }
+        Config::from_configuration(&map)
+    }
+
+    fn make_state_with_config(config: Config) -> State {
+        State {
+            config,
+            ..Default::default()
+        }
+    }
+
+    // === Config::from_configuration tests ===
+
+    #[test]
+    fn test_config_default() {
+        let config = make_config(&[]);
+        assert_eq!(config.source, Source::Cwd);
+        assert_eq!(config.format, Format::Basename);
+        assert_eq!(config.max_length, 0);
+        assert_eq!(config.truncate_side, TruncateSide::Right);
+        assert!(config.prefix.is_empty());
+        assert!(config.suffix.is_empty());
+        assert!(config.excludes.is_empty());
+    }
+
+    #[test]
+    fn test_config_source_process() {
+        let config = make_config(&[("source", "process")]);
+        assert_eq!(config.source, Source::Process);
+    }
+
+    #[test]
+    fn test_config_format_full() {
+        let config = make_config(&[("format", "full")]);
+        assert_eq!(config.format, Format::Full);
+    }
+
+    #[test]
+    fn test_config_format_tilde() {
+        let config = make_config(&[("format", "tilde")]);
+        assert_eq!(config.format, Format::Tilde);
+    }
+
+    #[test]
+    fn test_config_format_segments() {
+        let config = make_config(&[("format", "segments:3")]);
+        assert_eq!(config.format, Format::Segments(3));
+    }
+
+    #[test]
+    fn test_config_format_segments_invalid() {
+        let config = make_config(&[("format", "segments:abc")]);
+        assert_eq!(config.format, Format::Segments(1)); // default to 1
+    }
+
+    #[test]
+    fn test_config_max_length() {
+        let config = make_config(&[("max_length", "25")]);
+        assert_eq!(config.max_length, 25);
+    }
+
+    #[test]
+    fn test_config_truncate_left() {
+        let config = make_config(&[("truncate_side", "left")]);
+        assert_eq!(config.truncate_side, TruncateSide::Left);
+    }
+
+    #[test]
+    fn test_config_prefix_suffix() {
+        let config = make_config(&[("prefix", "["), ("suffix", "]")]);
+        assert_eq!(config.prefix, "[");
+        assert_eq!(config.suffix, "]");
+    }
+
+    #[test]
+    fn test_config_excludes_parsing() {
+        let config = make_config(&[("exclude", "/tmp:/var:/proc")]);
+        assert_eq!(config.excludes.len(), 3);
+        assert_eq!(config.excludes[0], PathBuf::from("/tmp"));
+        assert_eq!(config.excludes[1], PathBuf::from("/var"));
+        assert_eq!(config.excludes[2], PathBuf::from("/proc"));
+    }
+
+    #[test]
+    fn test_config_home_dir_explicit() {
+        let config = make_config(&[("home_dir", "/home/test")]);
+        assert_eq!(config.home_dir, Some(PathBuf::from("/home/test")));
+    }
+
+    // === is_shell_name tests ===
+
+    #[test]
+    fn test_is_shell_name_lowercase() {
+        assert!(State::is_shell_name("bash"));
+        assert!(State::is_shell_name("zsh"));
+        assert!(State::is_shell_name("fish"));
+        assert!(State::is_shell_name("sh"));
+        assert!(State::is_shell_name("nu"));
+    }
+
+    #[test]
+    fn test_is_shell_name_uppercase() {
+        assert!(State::is_shell_name("BASH"));
+        assert!(State::is_shell_name("ZSH"));
+        assert!(State::is_shell_name("FISH"));
+    }
+
+    #[test]
+    fn test_is_shell_name_mixed_case() {
+        assert!(State::is_shell_name("Bash"));
+        assert!(State::is_shell_name("ZsH"));
+    }
+
+    #[test]
+    fn test_is_shell_name_not_shell() {
+        assert!(!State::is_shell_name("vim"));
+        assert!(!State::is_shell_name("htop"));
+        assert!(!State::is_shell_name("cargo"));
+        assert!(!State::is_shell_name(""));
+    }
+
+    // === truncate_if_needed tests ===
+
+    #[test]
+    fn test_truncate_disabled() {
+        let state = make_state_with_config(make_config(&[])); // max_length = 0
+        assert_eq!(state.truncate_if_needed("very long string"), "very long string");
+    }
+
+    #[test]
+    fn test_truncate_not_needed() {
+        let state = make_state_with_config(make_config(&[("max_length", "20")]));
+        assert_eq!(state.truncate_if_needed("short"), "short");
+    }
+
+    #[test]
+    fn test_truncate_right() {
+        let state = make_state_with_config(make_config(&[("max_length", "10")]));
+        assert_eq!(state.truncate_if_needed("this is a long string"), "this is...");
+    }
+
+    #[test]
+    fn test_truncate_left() {
+        let state = make_state_with_config(make_config(&[
+            ("max_length", "10"),
+            ("truncate_side", "left"),
+        ]));
+        // "this is a long string" = 21 chars, keep last 7 = " string"
+        assert_eq!(state.truncate_if_needed("this is a long string"), "... string");
+    }
+
+    #[test]
+    fn test_truncate_utf8_chars() {
+        // "café" is 4 characters but 5 bytes
+        let state = make_state_with_config(make_config(&[("max_length", "7")]));
+        let result = state.truncate_if_needed("café world");
+        // Should truncate at character boundary, not byte boundary
+        assert_eq!(result, "café...");
+    }
+
+    #[test]
+    fn test_truncate_emoji() {
+        // Emojis are multi-byte
+        let state = make_state_with_config(make_config(&[("max_length", "6")]));
+        let result = state.truncate_if_needed("🚀🎉🔥 test");
+        assert_eq!(result, "🚀🎉🔥...");
+    }
+
+    // === last_n_segments tests ===
+
+    #[test]
+    fn test_last_n_segments_basic() {
+        let state = make_state_with_config(make_config(&[]));
+        let path = Path::new("/home/user/projects/myapp");
+        assert_eq!(state.last_n_segments(path, 2), "projects/myapp");
+    }
+
+    #[test]
+    fn test_last_n_segments_one() {
+        let state = make_state_with_config(make_config(&[]));
+        let path = Path::new("/home/user/projects/myapp");
+        assert_eq!(state.last_n_segments(path, 1), "myapp");
+    }
+
+    #[test]
+    fn test_last_n_segments_more_than_available() {
+        let state = make_state_with_config(make_config(&[]));
+        let path = Path::new("/home/user");
+        assert_eq!(state.last_n_segments(path, 10), "/home/user");
+    }
+
+    #[test]
+    fn test_last_n_segments_three() {
+        let state = make_state_with_config(make_config(&[]));
+        let path = Path::new("/a/b/c/d/e");
+        assert_eq!(state.last_n_segments(path, 3), "c/d/e");
+    }
+
+    // === replace_home_with_tilde tests ===
+
+    #[test]
+    fn test_replace_home_with_tilde_subdir() {
+        let state = make_state_with_config(make_config(&[("home_dir", "/home/user")]));
+        let path = Path::new("/home/user/projects/myapp");
+        assert_eq!(state.replace_home_with_tilde(path), "~/projects/myapp");
+    }
+
+    #[test]
+    fn test_replace_home_exact_match() {
+        let state = make_state_with_config(make_config(&[("home_dir", "/home/user")]));
+        let path = Path::new("/home/user");
+        assert_eq!(state.replace_home_with_tilde(path), "~");
+    }
+
+    #[test]
+    fn test_replace_home_no_match() {
+        let state = make_state_with_config(make_config(&[("home_dir", "/home/user")]));
+        let path = Path::new("/var/log/syslog");
+        assert_eq!(state.replace_home_with_tilde(path), "/var/log/syslog");
+    }
+
+    #[test]
+    fn test_replace_home_no_home_configured() {
+        let mut config = make_config(&[]);
+        config.home_dir = None;
+        let state = make_state_with_config(config);
+        let path = Path::new("/home/user/test");
+        assert_eq!(state.replace_home_with_tilde(path), "/home/user/test");
+    }
+
+    // === should_exclude tests ===
+
+    #[test]
+    fn test_should_exclude_match() {
+        let state = make_state_with_config(make_config(&[("exclude", "/tmp:/var")]));
+        assert!(state.should_exclude(Path::new("/tmp")));
+        assert!(state.should_exclude(Path::new("/tmp/foo")));
+        assert!(state.should_exclude(Path::new("/var/log")));
+    }
+
+    #[test]
+    fn test_should_exclude_no_match() {
+        let state = make_state_with_config(make_config(&[("exclude", "/tmp:/var")]));
+        assert!(!state.should_exclude(Path::new("/home/user")));
+        assert!(!state.should_exclude(Path::new("/usr/local")));
+    }
+
+    #[test]
+    fn test_should_exclude_empty() {
+        let state = make_state_with_config(make_config(&[]));
+        assert!(!state.should_exclude(Path::new("/tmp")));
+    }
+
+    // === format_path tests ===
+
+    #[test]
+    fn test_format_path_basename() {
+        let state = make_state_with_config(make_config(&[("format", "basename")]));
+        let path = Path::new("/home/user/projects/myapp");
+        assert_eq!(state.format_path(path), "myapp");
+    }
+
+    #[test]
+    fn test_format_path_full() {
+        let state = make_state_with_config(make_config(&[("format", "full")]));
+        let path = Path::new("/home/user/projects/myapp");
+        assert_eq!(state.format_path(path), "/home/user/projects/myapp");
+    }
+
+    #[test]
+    fn test_format_path_tilde() {
+        let state = make_state_with_config(make_config(&[
+            ("format", "tilde"),
+            ("home_dir", "/home/user"),
+        ]));
+        let path = Path::new("/home/user/projects/myapp");
+        assert_eq!(state.format_path(path), "~/projects/myapp");
+    }
+
+    #[test]
+    fn test_format_path_segments() {
+        let state = make_state_with_config(make_config(&[("format", "segments:2")]));
+        let path = Path::new("/home/user/projects/myapp");
+        assert_eq!(state.format_path(path), "projects/myapp");
+    }
+
+    #[test]
+    fn test_format_path_empty() {
+        let state = make_state_with_config(make_config(&[]));
+        let path = Path::new("");
+        assert_eq!(state.format_path(path), "");
+    }
+
+    #[test]
+    fn test_format_path_root() {
+        let state = make_state_with_config(make_config(&[("format", "basename")]));
+        let path = Path::new("/");
+        // Root has no file_name, should return "~" as fallback
+        assert_eq!(state.format_path(path), "~");
     }
 }
