@@ -1,0 +1,11 @@
+layout {
+    pane split_direction="vertical" {
+        pane edit="src/lib.rs"
+        pane command="bash" {
+            args "-c" "cargo build && echo 'Build OK!' || echo 'Build FAILED'"
+        }
+    }
+    pane size=1 borderless=true {
+        plugin location="file:target/wasm32-wasip1/debug/zellij_cwd_plugin.wasm"
+    }
+}

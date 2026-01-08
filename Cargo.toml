@@ -1,0 +1,14 @@
+[package]
+name = "zellij-cwd-plugin"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zellij-tile = { git = "https://github.com/zellij-org/zellij", branch = "main" }
+
+[profile.release]
+lto = true
+opt-level = "s"
