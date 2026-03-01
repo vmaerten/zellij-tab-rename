@@ -25,6 +25,8 @@ pub(crate) struct RenameState {
     pub git_root_cache: HashMap<PathBuf, Option<PathBuf>>,
     /// cwds with pending git lookups -> tab indices waiting for the result
     pub pending_git_lookups: HashMap<PathBuf, Vec<usize>>,
+    /// Terminal pane count per tab
+    pub pane_counts: HashMap<usize, usize>,
 }
 
 impl super::State {
@@ -57,6 +59,9 @@ impl super::State {
         self.decorations
             .tab_decoration_source
             .retain(|k, _| active_positions.contains(k));
+        self.rename
+            .pane_counts
+            .retain(|k, _| active_positions.contains(k));
 
         // Clean up pane_info for panes in tabs that no longer exist
         self.rename
@@ -88,11 +93,6 @@ impl super::State {
                 }
 
                 if let Some(pending_cwd) = self.rename.pending_cwds.remove(&pane_id) {
-                    eprintln!(
-                        "[cwd-plugin] draining pending CWD for pane {:?}: {}",
-                        pane_id,
-                        pending_cwd.display()
-                    );
                     pane_state.cwd = pending_cwd;
                     if pane.is_focused && !pane.is_plugin {
                         tabs_to_rename.insert(*tab_index);
@@ -100,21 +100,11 @@ impl super::State {
                 }
 
                 if pane.is_focused && !pane.is_plugin && pane_state.cwd.as_os_str().is_empty() {
-                    eprintln!(
-                        "[cwd-plugin] focused pane {:?} has no CWD, fetching...",
-                        pane_id
-                    );
                     match get_pane_cwd(pane_id) {
                         Ok(cwd) if !cwd.as_os_str().is_empty() => {
-                            eprintln!("[cwd-plugin] get_pane_cwd ok: {}", cwd.display());
                             pane_state.cwd = cwd;
                         }
-                        Ok(_) => {
-                            eprintln!("[cwd-plugin] get_pane_cwd returned empty");
-                        }
-                        Err(e) => {
-                            eprintln!("[cwd-plugin] get_pane_cwd error: {:?}", e);
-                        }
+                        _ => {}
                     }
                 }
 
@@ -135,6 +125,22 @@ impl super::State {
 
         self.rename.pane_info.retain(|id, _| seen_panes.contains(id));
 
+        // Recompute terminal pane counts per tab
+        if !self.config.pane_count.is_empty() {
+            let mut new_counts: HashMap<usize, usize> = HashMap::new();
+            for (tab_index, panes) in &manifest.panes {
+                let count = panes.iter().filter(|p| !p.is_plugin).count();
+                new_counts.insert(*tab_index, count);
+            }
+            for (tab_index, &new_count) in &new_counts {
+                let old_count = self.rename.pane_counts.get(tab_index).copied();
+                if old_count != Some(new_count) {
+                    tabs_to_rename.insert(*tab_index);
+                }
+            }
+            self.rename.pane_counts = new_counts;
+        }
+
         // Clean up decorations whose source pane is gone
         self.decorations
             .tab_decoration_source
@@ -148,9 +154,6 @@ impl super::State {
                 }
             });
 
-        if !tabs_to_rename.is_empty() {
-            eprintln!("[cwd-plugin] tabs marked for rename: {:?}", tabs_to_rename);
-        }
         for tab_index in tabs_to_rename {
             if let Some(&pane_id) = self.rename.focused_panes.get(&tab_index) {
                 self.update_tab_name(tab_index, &pane_id);

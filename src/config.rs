@@ -35,6 +35,8 @@ pub(crate) struct Config {
     pub suffix: String,
     pub excludes: Vec<PathBuf>,
     pub home_dir: Option<PathBuf>,
+    pub pane_count: String,
+    pub pane_count_min: usize,
 }
 
 impl Config {
@@ -89,6 +91,16 @@ impl Config {
             .map(PathBuf::from)
             .or_else(|| std::env::var("HOME").ok().map(PathBuf::from));
 
+        let pane_count = configuration
+            .get("pane_count")
+            .cloned()
+            .unwrap_or_default();
+
+        let pane_count_min = configuration
+            .get("pane_count_min")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
+
         Config {
             source,
             format,
@@ -99,6 +111,8 @@ impl Config {
             suffix,
             excludes,
             home_dir,
+            pane_count,
+            pane_count_min,
         }
     }
 }
@@ -202,5 +216,19 @@ mod tests {
     fn test_config_home_dir_explicit() {
         let config = make_config(&[("home_dir", "/home/test")]);
         assert_eq!(config.home_dir, Some(PathBuf::from("/home/test")));
+    }
+
+    #[test]
+    fn test_config_pane_count_default() {
+        let config = make_config(&[]);
+        assert!(config.pane_count.is_empty());
+        assert_eq!(config.pane_count_min, 2);
+    }
+
+    #[test]
+    fn test_config_pane_count_custom() {
+        let config = make_config(&[("pane_count", " ({count})"), ("pane_count_min", "3")]);
+        assert_eq!(config.pane_count, " ({count})");
+        assert_eq!(config.pane_count_min, 3);
     }
 }

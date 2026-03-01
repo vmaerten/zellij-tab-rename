@@ -78,8 +78,8 @@ impl ZellijPlugin for State {
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
         eprintln!(
-            "[cwd-plugin] pipe: name={}, args={:?}, payload={:?}",
-            pipe_message.name, pipe_message.args, pipe_message.payload
+            "[cwd-plugin] pipe: name={}, args={:?}",
+            pipe_message.name, pipe_message.args
         );
         let cli_pipe_id = match &pipe_message.source {
             PipeSource::Cli(id) => Some(id.clone()),
@@ -107,14 +107,9 @@ impl State {
                 self.handle_cwd_changed(pane_id, cwd);
             }
             Event::TabUpdate(tabs) => {
-                eprintln!("[cwd-plugin] event: TabUpdate ({} tabs)", tabs.len());
                 self.handle_tab_update(&tabs);
             }
             Event::PaneUpdate(manifest) => {
-                eprintln!(
-                    "[cwd-plugin] event: PaneUpdate ({} tabs)",
-                    manifest.panes.len()
-                );
                 self.handle_pane_update(manifest);
             }
             Event::RunCommandResult(exit_code, stdout, _stderr, context) => {
@@ -145,11 +140,25 @@ impl State {
             return;
         }
 
+        let pane_count_suffix = if !self.config.pane_count.is_empty() {
+            let count = self.rename.pane_counts.get(&tab_index).copied().unwrap_or(1);
+            if count >= self.config.pane_count_min {
+                self.config
+                    .pane_count
+                    .replace("{count}", &count.to_string())
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
         let deco = self.decorations.tab_decorations.get(&tab_index);
         let final_name = compose_tab_name(
             &name,
             &self.config.prefix,
             &self.config.suffix,
+            &pane_count_suffix,
             deco,
             self.config.max_length,
             &self.config.truncate_side,
