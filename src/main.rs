@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use serde::Deserialize;
 use zellij_tile::prelude::*;
 
 // === Configuration Enums ===
@@ -25,6 +26,16 @@ enum TruncateSide {
     Left,
     #[default]
     Right,
+}
+
+// === Pipe Protocol ===
+
+#[derive(Deserialize, Debug)]
+struct PipePayload {
+    action: String,
+    pane_id: Option<String>,
+    prefix: Option<String>,
+    suffix: Option<String>,
 }
 
 // === Configuration Struct ===
@@ -108,6 +119,14 @@ impl Config {
     }
 }
 
+// === Decorations ===
+
+#[derive(Default, Clone, Debug, PartialEq)]
+struct Decorations {
+    prefix: String,
+    suffix: String,
+}
+
 // === Pane State ===
 
 #[derive(Default)]
@@ -134,6 +153,12 @@ struct State {
     pending_git_lookups: HashMap<PathBuf, Vec<usize>>,
     /// Events received before permissions were granted
     buffered_events: Vec<Event>,
+    /// Per-tab decorations (prefix/suffix) set via pipe protocol
+    tab_decorations: HashMap<usize, Decorations>,
+    /// Which pane set the decoration on each tab (for cleanup when pane disappears)
+    tab_decoration_source: HashMap<usize, PaneId>,
+    /// Currently active (focused) tab index
+    active_tab: Option<usize>,
 }
 
 register_plugin!(State);
@@ -142,6 +167,56 @@ register_plugin!(State);
 const SHELL_NAMES: &[&str] = &[
     "bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "nu", "nushell",
 ];
+
+/// Compose a final tab name from a base CWD name, config prefix/suffix, and optional decorations.
+/// Truncation applies to the base name only (before adding decorations), so icons don't get cut off.
+fn compose_tab_name(
+    base: &str,
+    config_prefix: &str,
+    config_suffix: &str,
+    deco: Option<&Decorations>,
+    max_length: usize,
+    truncate_side: &TruncateSide,
+) -> String {
+    // Apply config prefix/suffix to base name
+    let with_config = if config_prefix.is_empty() && config_suffix.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}{}{}", config_prefix, base, config_suffix)
+    };
+
+    // Truncate the config-wrapped name (before decoration)
+    let truncated = truncate_name(&with_config, max_length, truncate_side);
+
+    // Wrap with decorations
+    let deco_prefix = deco.map(|d| d.prefix.as_str()).unwrap_or("");
+    let deco_suffix = deco.map(|d| d.suffix.as_str()).unwrap_or("");
+
+    if deco_prefix.is_empty() && deco_suffix.is_empty() {
+        truncated
+    } else {
+        format!("{}{}{}", deco_prefix, truncated, deco_suffix)
+    }
+}
+
+/// Truncate a string to max_length characters, adding "..." on the appropriate side.
+fn truncate_name(s: &str, max_length: usize, truncate_side: &TruncateSide) -> String {
+    let char_count = s.chars().count();
+    if max_length == 0 || char_count <= max_length {
+        return s.to_string();
+    }
+    let max = max_length.saturating_sub(3);
+    match truncate_side {
+        TruncateSide::Right => {
+            let truncated: String = s.chars().take(max).collect();
+            format!("{}...", truncated)
+        }
+        TruncateSide::Left => {
+            let truncated: String = s.chars().skip(char_count - max).collect();
+            format!("...{}", truncated)
+        }
+    }
+}
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
@@ -154,6 +229,7 @@ impl ZellijPlugin for State {
         let mut permissions = vec![
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
+            PermissionType::ReadCliPipes,
         ];
         let mut events = vec![
             EventType::CwdChanged,
@@ -193,6 +269,20 @@ impl ZellijPlugin for State {
             }
         }
         false
+    }
+
+    fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        eprintln!("[cwd-plugin] pipe: name={}, args={:?}, payload={:?}",
+            pipe_message.name, pipe_message.args, pipe_message.payload);
+        let cli_pipe_id = match &pipe_message.source {
+            PipeSource::Cli(id) => Some(id.clone()),
+            _ => None,
+        };
+        let handled = self.handle_pipe(pipe_message);
+        if let Some(ref pipe_id) = cli_pipe_id {
+            unblock_cli_pipe_input(pipe_id);
+        }
+        handled
     }
 
     fn render(&mut self, _rows: usize, _cols: usize) {}
@@ -238,17 +328,27 @@ impl State {
     fn handle_tab_update(&mut self, tabs: &[TabInfo]) {
         let active_positions: HashSet<usize> = tabs.iter().map(|t| t.position).collect();
 
+        // Track which tab is focused
+        for tab in tabs {
+            if tab.active {
+                self.active_tab = Some(tab.position);
+            }
+        }
+
         self.current_tab_names
             .retain(|k, _| active_positions.contains(k));
         self.focused_panes
             .retain(|k, _| active_positions.contains(k));
+        // Clean up decorations for closed tabs
+        self.tab_decorations
+            .retain(|k, _| active_positions.contains(k));
+        self.tab_decoration_source
+            .retain(|k, _| active_positions.contains(k));
 
         // Invalidate cache when actual tab name differs from expected
-        // (another plugin like zellij-tab-status may have overwritten our rename)
-        // Tolerate prefixes added by other plugins (e.g. "◉ dotfiles" matches "dotfiles")
         for tab in tabs {
             if let Some(expected) = self.current_tab_names.get(&tab.position) {
-                if tab.name != *expected && !tab.name.ends_with(expected.as_str()) {
+                if tab.name != *expected {
                     eprintln!(
                         "[cwd-plugin] tab {} name mismatch: expected \"{}\", actual \"{}\" — invalidating",
                         tab.position, expected, tab.name
@@ -343,6 +443,17 @@ impl State {
 
         // Remove panes that are no longer present
         self.pane_info.retain(|id, _| seen_panes.contains(id));
+
+        // Clean up decorations whose source pane is gone
+        self.tab_decoration_source.retain(|tab_idx, source_pane| {
+            if seen_panes.contains(source_pane) {
+                true
+            } else {
+                self.tab_decorations.remove(tab_idx);
+                tabs_to_rename.insert(*tab_idx);
+                false
+            }
+        });
 
         // Now rename all tabs that need it
         if !tabs_to_rename.is_empty() {
@@ -499,13 +610,15 @@ impl State {
             return;
         }
 
-        let final_name = if self.config.prefix.is_empty() && self.config.suffix.is_empty() {
-            name
-        } else {
-            format!("{}{}{}", self.config.prefix, name, self.config.suffix)
-        };
-
-        let final_name = self.truncate_if_needed(&final_name);
+        let deco = self.tab_decorations.get(&tab_index);
+        let final_name = compose_tab_name(
+            &name,
+            &self.config.prefix,
+            &self.config.suffix,
+            deco,
+            self.config.max_length,
+            &self.config.truncate_side,
+        );
         self.rename_tab_if_needed(tab_index, &final_name);
     }
 
@@ -551,27 +664,6 @@ impl State {
             .to_string()
     }
 
-    fn truncate_if_needed(&self, s: &str) -> String {
-        let char_count = s.chars().count();
-
-        if self.config.max_length == 0 || char_count <= self.config.max_length {
-            return s.to_string();
-        }
-
-        let max = self.config.max_length.saturating_sub(3); // Reserve space for "..."
-
-        match self.config.truncate_side {
-            TruncateSide::Right => {
-                let truncated: String = s.chars().take(max).collect();
-                format!("{}...", truncated)
-            }
-            TruncateSide::Left => {
-                let truncated: String = s.chars().skip(char_count - max).collect();
-                format!("...{}", truncated)
-            }
-        }
-    }
-
     fn should_exclude(&self, path: &Path) -> bool {
         self.config
             .excludes
@@ -583,6 +675,169 @@ impl State {
         SHELL_NAMES
             .iter()
             .any(|shell| shell.eq_ignore_ascii_case(name))
+    }
+
+    fn handle_pipe(&mut self, msg: PipeMessage) -> bool {
+        // Try JSON payload first (targeted --plugin protocol)
+        if let Some(ref payload_str) = msg.payload {
+            if let Ok(payload) = serde_json::from_str::<PipePayload>(payload_str) {
+                return self.handle_pipe_json(payload);
+            }
+        }
+
+        // Fallback: legacy protocol (--name + --args)
+        self.handle_pipe_legacy(msg)
+    }
+
+    fn handle_pipe_json(&mut self, payload: PipePayload) -> bool {
+        let action = payload.action.as_str();
+        match action {
+            "set_prefix" | "set_suffix" | "clear" => {}
+            _ => {
+                eprintln!("[cwd-plugin] pipe: unknown action \"{}\"", action);
+                return false;
+            }
+        }
+
+        let tab_index = if let Some(ref pane_str) = payload.pane_id {
+            match pane_str.parse::<u32>() {
+                Ok(id) => {
+                    let pane_id = PaneId::Terminal(id);
+                    self.pane_info.get(&pane_id).map(|ps| (ps.tab_index, Some(pane_id)))
+                }
+                Err(_) => {
+                    eprintln!("[cwd-plugin] pipe: invalid pane id \"{}\"", pane_str);
+                    return true;
+                }
+            }
+        } else if action == "clear" {
+            self.tab_decorations.clear();
+            self.tab_decoration_source.clear();
+            for (&tab_idx, &pane_id) in &self.focused_panes.clone() {
+                self.update_tab_name(tab_idx, &pane_id);
+            }
+            return true;
+        } else {
+            eprintln!("[cwd-plugin] pipe: no pane_id for \"{}\"", action);
+            return true;
+        };
+
+        let Some((tab_idx, pane_id)) = tab_index else {
+            let known_panes: Vec<_> = self.pane_info.keys().collect();
+            eprintln!(
+                "[cwd-plugin] pipe: could not resolve tab for pane_id {:?}, known panes: {:?}",
+                payload.pane_id, known_panes
+            );
+            return true;
+        };
+
+        match action {
+            "set_prefix" => {
+                let prefix = payload.prefix.unwrap_or_default();
+                let deco = self.tab_decorations.entry(tab_idx).or_default();
+                deco.prefix = prefix;
+                if let Some(pid) = pane_id {
+                    self.tab_decoration_source.insert(tab_idx, pid);
+                }
+            }
+            "set_suffix" => {
+                let suffix = payload.suffix.unwrap_or_default();
+                let deco = self.tab_decorations.entry(tab_idx).or_default();
+                deco.suffix = suffix;
+                if let Some(pid) = pane_id {
+                    self.tab_decoration_source.insert(tab_idx, pid);
+                }
+            }
+            "clear" => {
+                self.tab_decorations.remove(&tab_idx);
+                self.tab_decoration_source.remove(&tab_idx);
+            }
+            _ => unreachable!(),
+        }
+
+        if let Some(&pane_id) = self.focused_panes.get(&tab_idx) {
+            self.update_tab_name(tab_idx, &pane_id);
+        }
+        true
+    }
+
+    fn handle_pipe_legacy(&mut self, msg: PipeMessage) -> bool {
+        let action = msg.name.as_str();
+        match action {
+            "set_prefix" | "set_suffix" | "clear" => {}
+            _ => {
+                return false;
+            }
+        }
+
+        let tab_index = if let Some(pane_str) = msg.args.get("pane") {
+            match pane_str.parse::<u32>() {
+                Ok(id) => {
+                    let pane_id = PaneId::Terminal(id);
+                    self.pane_info.get(&pane_id).map(|ps| (ps.tab_index, Some(pane_id)))
+                }
+                Err(_) => {
+                    eprintln!("[cwd-plugin] pipe: invalid pane id \"{}\"", pane_str);
+                    return true;
+                }
+            }
+        } else if msg.args.get("tab").map(|s| s.as_str()) == Some("focused") {
+            self.active_tab.map(|idx| (idx, None))
+        } else if action == "clear" {
+            self.tab_decorations.clear();
+            self.tab_decoration_source.clear();
+            for (&tab_idx, &pane_id) in &self.focused_panes.clone() {
+                self.update_tab_name(tab_idx, &pane_id);
+            }
+            return true;
+        } else {
+            eprintln!("[cwd-plugin] pipe: no pane or tab specified for \"{}\"", action);
+            return true;
+        };
+
+        let Some((tab_idx, pane_id)) = tab_index else {
+            let known_panes: Vec<_> = self.pane_info.keys().collect();
+            eprintln!(
+                "[cwd-plugin] pipe: could not resolve tab for args {:?}, known panes: {:?}",
+                msg.args, known_panes
+            );
+            return true;
+        };
+
+        match action {
+            "set_prefix" => {
+                let payload = match msg.payload {
+                    Some(ref p) if !p.is_empty() && !p.starts_with('{') => p.clone(),
+                    _ => return true, // skip: None/empty or Claude hook metadata JSON
+                };
+                let deco = self.tab_decorations.entry(tab_idx).or_default();
+                deco.prefix = payload;
+                if let Some(pid) = pane_id {
+                    self.tab_decoration_source.insert(tab_idx, pid);
+                }
+            }
+            "set_suffix" => {
+                let payload = match msg.payload {
+                    Some(ref p) if !p.is_empty() && !p.starts_with('{') => p.clone(),
+                    _ => return true,
+                };
+                let deco = self.tab_decorations.entry(tab_idx).or_default();
+                deco.suffix = payload;
+                if let Some(pid) = pane_id {
+                    self.tab_decoration_source.insert(tab_idx, pid);
+                }
+            }
+            "clear" => {
+                self.tab_decorations.remove(&tab_idx);
+                self.tab_decoration_source.remove(&tab_idx);
+            }
+            _ => unreachable!(),
+        }
+
+        if let Some(&pane_id) = self.focused_panes.get(&tab_idx) {
+            self.update_tab_name(tab_idx, &pane_id);
+        }
+        true
     }
 
     fn rename_tab_if_needed(&mut self, tab_position: usize, new_name: &str) {
@@ -748,41 +1003,33 @@ mod tests {
         assert!(!State::is_shell_name(""));
     }
 
-    // === truncate_if_needed tests ===
+    // === truncate (via truncate_name) tests ===
 
     #[test]
     fn test_truncate_disabled() {
-        let state = make_state_with_config(make_config(&[])); // max_length = 0
-        assert_eq!(state.truncate_if_needed("very long string"), "very long string");
+        assert_eq!(truncate_name("very long string", 0, &TruncateSide::Right), "very long string");
     }
 
     #[test]
     fn test_truncate_not_needed() {
-        let state = make_state_with_config(make_config(&[("max_length", "20")]));
-        assert_eq!(state.truncate_if_needed("short"), "short");
+        assert_eq!(truncate_name("short", 20, &TruncateSide::Right), "short");
     }
 
     #[test]
     fn test_truncate_right() {
-        let state = make_state_with_config(make_config(&[("max_length", "10")]));
-        assert_eq!(state.truncate_if_needed("this is a long string"), "this is...");
+        assert_eq!(truncate_name("this is a long string", 10, &TruncateSide::Right), "this is...");
     }
 
     #[test]
     fn test_truncate_left() {
-        let state = make_state_with_config(make_config(&[
-            ("max_length", "10"),
-            ("truncate_side", "left"),
-        ]));
         // "this is a long string" = 21 chars, keep last 7 = " string"
-        assert_eq!(state.truncate_if_needed("this is a long string"), "... string");
+        assert_eq!(truncate_name("this is a long string", 10, &TruncateSide::Left), "... string");
     }
 
     #[test]
     fn test_truncate_utf8_chars() {
         // "café" is 4 characters but 5 bytes
-        let state = make_state_with_config(make_config(&[("max_length", "7")]));
-        let result = state.truncate_if_needed("café world");
+        let result = truncate_name("café world", 7, &TruncateSide::Right);
         // Should truncate at character boundary, not byte boundary
         assert_eq!(result, "café...");
     }
@@ -790,8 +1037,7 @@ mod tests {
     #[test]
     fn test_truncate_emoji() {
         // Emojis are multi-byte
-        let state = make_state_with_config(make_config(&[("max_length", "6")]));
-        let result = state.truncate_if_needed("🚀🎉🔥 test");
+        let result = truncate_name("🚀🎉🔥 test", 6, &TruncateSide::Right);
         assert_eq!(result, "🚀🎉🔥...");
     }
 
@@ -1028,6 +1274,245 @@ mod tests {
         );
         let rebased = state.rebase_on_git_root(Path::new("/home/user/dev/proj/src/lib"), 0);
         assert_eq!(state.format_path(&rebased), "src/lib");
+    }
+
+    // === compose_tab_name tests ===
+
+    #[test]
+    fn test_compose_plain() {
+        let result = compose_tab_name("myapp", "", "", None, 0, &TruncateSide::Right);
+        assert_eq!(result, "myapp");
+    }
+
+    #[test]
+    fn test_compose_with_config_prefix_suffix() {
+        let result = compose_tab_name("myapp", "[", "]", None, 0, &TruncateSide::Right);
+        assert_eq!(result, "[myapp]");
+    }
+
+    #[test]
+    fn test_compose_with_decorations() {
+        let deco = Decorations { prefix: "🔨 ".to_string(), suffix: String::new() };
+        let result = compose_tab_name("myapp", "", "", Some(&deco), 0, &TruncateSide::Right);
+        assert_eq!(result, "🔨 myapp");
+    }
+
+    #[test]
+    fn test_compose_with_both() {
+        let deco = Decorations { prefix: "🔨 ".to_string(), suffix: " ✓".to_string() };
+        let result = compose_tab_name("myapp", "[", "]", Some(&deco), 0, &TruncateSide::Right);
+        assert_eq!(result, "🔨 [myapp] ✓");
+    }
+
+    #[test]
+    fn test_compose_truncation_on_base_not_deco() {
+        let deco = Decorations { prefix: "🔨 ".to_string(), suffix: String::new() };
+        // max_length=10 applies to "[myapp]" (7 chars, fits), then deco wraps it
+        let result = compose_tab_name("myapp", "[", "]", Some(&deco), 10, &TruncateSide::Right);
+        assert_eq!(result, "🔨 [myapp]");
+    }
+
+    #[test]
+    fn test_compose_truncation_triggers() {
+        let deco = Decorations { prefix: "🔨 ".to_string(), suffix: String::new() };
+        // "[very-long-name]" = 16 chars, max_length=10 → truncate to "[very-l..."
+        let result = compose_tab_name("very-long-name", "[", "]", Some(&deco), 10, &TruncateSide::Right);
+        assert_eq!(result, "🔨 [very-l...");
+    }
+
+    #[test]
+    fn test_compose_empty_decorations() {
+        let deco = Decorations { prefix: String::new(), suffix: String::new() };
+        let result = compose_tab_name("myapp", "", "", Some(&deco), 0, &TruncateSide::Right);
+        assert_eq!(result, "myapp");
+    }
+
+    // === truncate_name tests ===
+
+    #[test]
+    fn test_truncate_name_disabled() {
+        assert_eq!(truncate_name("hello world", 0, &TruncateSide::Right), "hello world");
+    }
+
+    #[test]
+    fn test_truncate_name_not_needed() {
+        assert_eq!(truncate_name("short", 10, &TruncateSide::Right), "short");
+    }
+
+    #[test]
+    fn test_truncate_name_right() {
+        assert_eq!(truncate_name("this is a long string", 10, &TruncateSide::Right), "this is...");
+    }
+
+    #[test]
+    fn test_truncate_name_left() {
+        assert_eq!(truncate_name("this is a long string", 10, &TruncateSide::Left), "... string");
+    }
+
+    // === handle_pipe resolution tests ===
+
+    #[test]
+    fn test_pipe_set_prefix() {
+        let mut state = make_state_with_config(make_config(&[]));
+        // Set up a known pane in tab 0
+        state.pane_info.insert(PaneId::Terminal(42), PaneState {
+            tab_index: 0,
+            cwd: PathBuf::from("/home/user/myapp"),
+            title: String::new(),
+        });
+        state.focused_panes.insert(0, PaneId::Terminal(42));
+
+        let msg = PipeMessage {
+            source: PipeSource::Cli("test".to_string()),
+            name: "set_prefix".to_string(),
+            payload: Some("🔨 ".to_string()),
+            args: BTreeMap::from([("pane".to_string(), "42".to_string())]),
+            is_private: false,
+        };
+        state.handle_pipe(msg);
+
+        assert_eq!(
+            state.tab_decorations.get(&0),
+            Some(&Decorations { prefix: "🔨 ".to_string(), suffix: String::new() })
+        );
+        assert_eq!(state.tab_decoration_source.get(&0), Some(&PaneId::Terminal(42)));
+    }
+
+    #[test]
+    fn test_pipe_set_suffix() {
+        let mut state = make_state_with_config(make_config(&[]));
+        state.pane_info.insert(PaneId::Terminal(7), PaneState {
+            tab_index: 2,
+            cwd: PathBuf::from("/tmp"),
+            title: String::new(),
+        });
+
+        let msg = PipeMessage {
+            source: PipeSource::Cli("test".to_string()),
+            name: "set_suffix".to_string(),
+            payload: Some(" ✓".to_string()),
+            args: BTreeMap::from([("pane".to_string(), "7".to_string())]),
+            is_private: false,
+        };
+        state.handle_pipe(msg);
+
+        assert_eq!(
+            state.tab_decorations.get(&2),
+            Some(&Decorations { prefix: String::new(), suffix: " ✓".to_string() })
+        );
+    }
+
+    #[test]
+    fn test_pipe_clear_specific_pane() {
+        let mut state = make_state_with_config(make_config(&[]));
+        state.pane_info.insert(PaneId::Terminal(42), PaneState {
+            tab_index: 0,
+            cwd: PathBuf::from("/tmp"),
+            title: String::new(),
+        });
+        state.tab_decorations.insert(0, Decorations { prefix: "🔨 ".to_string(), suffix: String::new() });
+        state.tab_decoration_source.insert(0, PaneId::Terminal(42));
+
+        let msg = PipeMessage {
+            source: PipeSource::Cli("test".to_string()),
+            name: "clear".to_string(),
+            payload: None,
+            args: BTreeMap::from([("pane".to_string(), "42".to_string())]),
+            is_private: false,
+        };
+        state.handle_pipe(msg);
+
+        assert!(state.tab_decorations.is_empty());
+        assert!(state.tab_decoration_source.is_empty());
+    }
+
+    #[test]
+    fn test_pipe_clear_all() {
+        let mut state = make_state_with_config(make_config(&[]));
+        state.tab_decorations.insert(0, Decorations { prefix: "🔨 ".to_string(), suffix: String::new() });
+        state.tab_decorations.insert(1, Decorations { prefix: "⏳ ".to_string(), suffix: String::new() });
+        state.tab_decoration_source.insert(0, PaneId::Terminal(1));
+        state.tab_decoration_source.insert(1, PaneId::Terminal(2));
+
+        let msg = PipeMessage {
+            source: PipeSource::Cli("test".to_string()),
+            name: "clear".to_string(),
+            payload: None,
+            args: BTreeMap::new(),
+            is_private: false,
+        };
+        state.handle_pipe(msg);
+
+        assert!(state.tab_decorations.is_empty());
+        assert!(state.tab_decoration_source.is_empty());
+    }
+
+    #[test]
+    fn test_pipe_focused_tab_fallback() {
+        let mut state = make_state_with_config(make_config(&[]));
+        state.active_tab = Some(1);
+
+        let msg = PipeMessage {
+            source: PipeSource::Cli("test".to_string()),
+            name: "set_prefix".to_string(),
+            payload: Some("⏳ ".to_string()),
+            args: BTreeMap::from([("tab".to_string(), "focused".to_string())]),
+            is_private: false,
+        };
+        state.handle_pipe(msg);
+
+        assert_eq!(
+            state.tab_decorations.get(&1),
+            Some(&Decorations { prefix: "⏳ ".to_string(), suffix: String::new() })
+        );
+    }
+
+    #[test]
+    fn test_pipe_unknown_action_ignored() {
+        let mut state = make_state_with_config(make_config(&[]));
+
+        let msg = PipeMessage {
+            source: PipeSource::Cli("test".to_string()),
+            name: "unknown_action".to_string(),
+            payload: None,
+            args: BTreeMap::new(),
+            is_private: false,
+        };
+        state.handle_pipe(msg);
+
+        assert!(state.tab_decorations.is_empty());
+    }
+
+    #[test]
+    fn test_pipe_invalid_pane_id() {
+        let mut state = make_state_with_config(make_config(&[]));
+
+        let msg = PipeMessage {
+            source: PipeSource::Cli("test".to_string()),
+            name: "set_prefix".to_string(),
+            payload: Some("🔨 ".to_string()),
+            args: BTreeMap::from([("pane".to_string(), "not_a_number".to_string())]),
+            is_private: false,
+        };
+        state.handle_pipe(msg);
+
+        assert!(state.tab_decorations.is_empty());
+    }
+
+    #[test]
+    fn test_pipe_pane_not_found() {
+        let mut state = make_state_with_config(make_config(&[]));
+        // pane 999 doesn't exist in pane_info
+        let msg = PipeMessage {
+            source: PipeSource::Cli("test".to_string()),
+            name: "set_prefix".to_string(),
+            payload: Some("🔨 ".to_string()),
+            args: BTreeMap::from([("pane".to_string(), "999".to_string())]),
+            is_private: false,
+        };
+        state.handle_pipe(msg);
+
+        assert!(state.tab_decorations.is_empty());
     }
 
 }

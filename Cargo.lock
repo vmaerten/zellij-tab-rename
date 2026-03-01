@@ -3018,6 +3018,8 @@ dependencies = [
 name = "zellij-cwd-plugin"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "zellij-tile",
 ]
 
