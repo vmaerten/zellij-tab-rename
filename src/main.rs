@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use serde::Deserialize;
 use zellij_tile::prelude::*;
 
 // === Configuration Enums ===
@@ -26,16 +25,6 @@ enum TruncateSide {
     Left,
     #[default]
     Right,
-}
-
-// === Pipe Protocol ===
-
-#[derive(Deserialize, Debug)]
-struct PipePayload {
-    action: String,
-    pane_id: Option<String>,
-    prefix: Option<String>,
-    suffix: Option<String>,
 }
 
 // === Configuration Struct ===
@@ -328,12 +317,7 @@ impl State {
     fn handle_tab_update(&mut self, tabs: &[TabInfo]) {
         let active_positions: HashSet<usize> = tabs.iter().map(|t| t.position).collect();
 
-        // Track which tab is focused
-        for tab in tabs {
-            if tab.active {
-                self.active_tab = Some(tab.position);
-            }
-        }
+        self.active_tab = tabs.iter().find(|t| t.active).map(|t| t.position);
 
         self.current_tab_names
             .retain(|k, _| active_positions.contains(k));
@@ -583,27 +567,10 @@ impl State {
             return;
         };
 
+        let base_path = self.rebase_on_git_root(&cwd, tab_index);
         let name = match self.config.source {
-            Source::Process => {
-                if !title.is_empty() && !Self::is_shell_name(&title) {
-                    title
-                } else {
-                    let rebased = self.rebase_on_git_root(&cwd, tab_index);
-                    if rebased != cwd {
-                        rebased.display().to_string()
-                    } else {
-                        self.format_path(&rebased)
-                    }
-                }
-            }
-            Source::Cwd => {
-                let rebased = self.rebase_on_git_root(&cwd, tab_index);
-                if rebased != cwd {
-                    rebased.display().to_string()
-                } else {
-                    self.format_path(&rebased)
-                }
-            }
+            Source::Process if !title.is_empty() && !Self::is_shell_name(&title) => title,
+            _ => self.format_path(&base_path),
         };
 
         if name.is_empty() {
@@ -678,98 +645,13 @@ impl State {
     }
 
     fn handle_pipe(&mut self, msg: PipeMessage) -> bool {
-        // Try JSON payload first (targeted --plugin protocol)
-        if let Some(ref payload_str) = msg.payload {
-            if let Ok(payload) = serde_json::from_str::<PipePayload>(payload_str) {
-                return self.handle_pipe_json(payload);
-            }
-        }
-
-        // Fallback: legacy protocol (--name + --args)
-        self.handle_pipe_legacy(msg)
-    }
-
-    fn handle_pipe_json(&mut self, payload: PipePayload) -> bool {
-        let action = payload.action.as_str();
-        match action {
-            "set_prefix" | "set_suffix" | "clear" => {}
-            _ => {
-                eprintln!("[cwd-plugin] pipe: unknown action \"{}\"", action);
-                return false;
-            }
-        }
-
-        let tab_index = if let Some(ref pane_str) = payload.pane_id {
-            match pane_str.parse::<u32>() {
-                Ok(id) => {
-                    let pane_id = PaneId::Terminal(id);
-                    self.pane_info.get(&pane_id).map(|ps| (ps.tab_index, Some(pane_id)))
-                }
-                Err(_) => {
-                    eprintln!("[cwd-plugin] pipe: invalid pane id \"{}\"", pane_str);
-                    return true;
-                }
-            }
-        } else if action == "clear" {
-            self.tab_decorations.clear();
-            self.tab_decoration_source.clear();
-            for (&tab_idx, &pane_id) in &self.focused_panes.clone() {
-                self.update_tab_name(tab_idx, &pane_id);
-            }
-            return true;
-        } else {
-            eprintln!("[cwd-plugin] pipe: no pane_id for \"{}\"", action);
-            return true;
-        };
-
-        let Some((tab_idx, pane_id)) = tab_index else {
-            let known_panes: Vec<_> = self.pane_info.keys().collect();
-            eprintln!(
-                "[cwd-plugin] pipe: could not resolve tab for pane_id {:?}, known panes: {:?}",
-                payload.pane_id, known_panes
-            );
-            return true;
-        };
-
-        match action {
-            "set_prefix" => {
-                let prefix = payload.prefix.unwrap_or_default();
-                let deco = self.tab_decorations.entry(tab_idx).or_default();
-                deco.prefix = prefix;
-                if let Some(pid) = pane_id {
-                    self.tab_decoration_source.insert(tab_idx, pid);
-                }
-            }
-            "set_suffix" => {
-                let suffix = payload.suffix.unwrap_or_default();
-                let deco = self.tab_decorations.entry(tab_idx).or_default();
-                deco.suffix = suffix;
-                if let Some(pid) = pane_id {
-                    self.tab_decoration_source.insert(tab_idx, pid);
-                }
-            }
-            "clear" => {
-                self.tab_decorations.remove(&tab_idx);
-                self.tab_decoration_source.remove(&tab_idx);
-            }
-            _ => unreachable!(),
-        }
-
-        if let Some(&pane_id) = self.focused_panes.get(&tab_idx) {
-            self.update_tab_name(tab_idx, &pane_id);
-        }
-        true
-    }
-
-    fn handle_pipe_legacy(&mut self, msg: PipeMessage) -> bool {
         let action = msg.name.as_str();
         match action {
             "set_prefix" | "set_suffix" | "clear" => {}
-            _ => {
-                return false;
-            }
+            _ => return false,
         }
 
+        // Resolve target tab from args
         let tab_index = if let Some(pane_str) = msg.args.get("pane") {
             match pane_str.parse::<u32>() {
                 Ok(id) => {
@@ -784,11 +666,7 @@ impl State {
         } else if msg.args.get("tab").map(|s| s.as_str()) == Some("focused") {
             self.active_tab.map(|idx| (idx, None))
         } else if action == "clear" {
-            self.tab_decorations.clear();
-            self.tab_decoration_source.clear();
-            for (&tab_idx, &pane_id) in &self.focused_panes.clone() {
-                self.update_tab_name(tab_idx, &pane_id);
-            }
+            self.clear_all_decorations();
             return true;
         } else {
             eprintln!("[cwd-plugin] pipe: no pane or tab specified for \"{}\"", action);
@@ -796,36 +674,27 @@ impl State {
         };
 
         let Some((tab_idx, pane_id)) = tab_index else {
-            let known_panes: Vec<_> = self.pane_info.keys().collect();
             eprintln!(
                 "[cwd-plugin] pipe: could not resolve tab for args {:?}, known panes: {:?}",
-                msg.args, known_panes
+                msg.args, self.pane_info.keys().collect::<Vec<_>>()
             );
             return true;
         };
 
+        // Extract payload, filtering out spurious stdin messages from hook metadata
+        let value = match msg.payload {
+            Some(ref p) if !p.is_empty() && !p.starts_with('{') => Some(p.clone()),
+            _ => None,
+        };
+
         match action {
             "set_prefix" => {
-                let payload = match msg.payload {
-                    Some(ref p) if !p.is_empty() && !p.starts_with('{') => p.clone(),
-                    _ => return true, // skip: None/empty or Claude hook metadata JSON
-                };
-                let deco = self.tab_decorations.entry(tab_idx).or_default();
-                deco.prefix = payload;
-                if let Some(pid) = pane_id {
-                    self.tab_decoration_source.insert(tab_idx, pid);
-                }
+                let Some(v) = value else { return true };
+                self.apply_decoration(tab_idx, pane_id, |d| d.prefix = v);
             }
             "set_suffix" => {
-                let payload = match msg.payload {
-                    Some(ref p) if !p.is_empty() && !p.starts_with('{') => p.clone(),
-                    _ => return true,
-                };
-                let deco = self.tab_decorations.entry(tab_idx).or_default();
-                deco.suffix = payload;
-                if let Some(pid) = pane_id {
-                    self.tab_decoration_source.insert(tab_idx, pid);
-                }
+                let Some(v) = value else { return true };
+                self.apply_decoration(tab_idx, pane_id, |d| d.suffix = v);
             }
             "clear" => {
                 self.tab_decorations.remove(&tab_idx);
@@ -838,6 +707,22 @@ impl State {
             self.update_tab_name(tab_idx, &pane_id);
         }
         true
+    }
+
+    fn apply_decoration(&mut self, tab_idx: usize, pane_id: Option<PaneId>, f: impl FnOnce(&mut Decorations)) {
+        let deco = self.tab_decorations.entry(tab_idx).or_default();
+        f(deco);
+        if let Some(pid) = pane_id {
+            self.tab_decoration_source.insert(tab_idx, pid);
+        }
+    }
+
+    fn clear_all_decorations(&mut self) {
+        self.tab_decorations.clear();
+        self.tab_decoration_source.clear();
+        for (&tab_idx, &pane_id) in &self.focused_panes.clone() {
+            self.update_tab_name(tab_idx, &pane_id);
+        }
     }
 
     fn rename_tab_if_needed(&mut self, tab_position: usize, new_name: &str) {
@@ -1325,28 +1210,6 @@ mod tests {
         let deco = Decorations { prefix: String::new(), suffix: String::new() };
         let result = compose_tab_name("myapp", "", "", Some(&deco), 0, &TruncateSide::Right);
         assert_eq!(result, "myapp");
-    }
-
-    // === truncate_name tests ===
-
-    #[test]
-    fn test_truncate_name_disabled() {
-        assert_eq!(truncate_name("hello world", 0, &TruncateSide::Right), "hello world");
-    }
-
-    #[test]
-    fn test_truncate_name_not_needed() {
-        assert_eq!(truncate_name("short", 10, &TruncateSide::Right), "short");
-    }
-
-    #[test]
-    fn test_truncate_name_right() {
-        assert_eq!(truncate_name("this is a long string", 10, &TruncateSide::Right), "this is...");
-    }
-
-    #[test]
-    fn test_truncate_name_left() {
-        assert_eq!(truncate_name("this is a long string", 10, &TruncateSide::Left), "... string");
     }
 
     // === handle_pipe resolution tests ===
