@@ -58,28 +58,6 @@ impl super::State {
             .tab_decoration_source
             .retain(|k, _| active_positions.contains(k));
 
-        // Invalidate cache when actual tab name differs from expected
-        for tab in tabs {
-            if let Some(expected) = self.current_tab_names.get(&tab.position) {
-                if tab.name != *expected {
-                    eprintln!(
-                        "[cwd-plugin] tab {} name mismatch: expected \"{}\", actual \"{}\" — invalidating",
-                        tab.position, expected, tab.name
-                    );
-                    self.current_tab_names.remove(&tab.position);
-                }
-            }
-        }
-
-        // Re-trigger rename for tabs whose name was overwritten
-        for tab in tabs {
-            if !self.current_tab_names.contains_key(&tab.position) {
-                if let Some(&pane_id) = self.rename.focused_panes.get(&tab.position) {
-                    self.update_tab_name(tab.position, &pane_id);
-                }
-            }
-        }
-
         // Clean up pane_info for panes in tabs that no longer exist
         self.rename
             .pane_info
