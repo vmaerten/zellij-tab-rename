@@ -3,8 +3,9 @@ name = "zellij-cwd-plugin"
 version = "0.1.0"
 edition = "2021"
 
-[lib]
-crate-type = ["cdylib"]
+[[bin]]
+name = "zellij_cwd_plugin"
+path = "src/main.rs"
 
 [dependencies]
 zellij-tile = { git = "https://github.com/zellij-org/zellij", branch = "main" }
