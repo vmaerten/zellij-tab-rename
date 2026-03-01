@@ -532,12 +532,7 @@ impl State {
             return path.to_path_buf();
         }
 
-        let git_root = match self.resolve_git_root(path, tab_index) {
-            Some(root) => root,
-            None => return path.to_path_buf(),
-        };
-
-        let Some(git_root) = git_root else {
+        let Some(Some(git_root)) = self.resolve_git_root(path, tab_index) else {
             return path.to_path_buf();
         };
 
