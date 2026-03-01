@@ -1,10 +1,14 @@
 [package]
-name = "zellij-cwd-plugin"
+name = "zellij-tab-rename"
 version = "0.1.0"
 edition = "2021"
+description = "Zellij plugin that automatically renames tabs based on CWD, process name, or git root"
+license = "MIT"
+repository = "https://github.com/vmaerten/zellij-tab-rename"
+keywords = ["zellij", "plugin", "terminal", "tab"]
 
 [[bin]]
-name = "zellij_cwd_plugin"
+name = "zellij-tab-rename"
 path = "src/main.rs"
 
 [dependencies]

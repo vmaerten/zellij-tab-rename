@@ -3015,7 +3015,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zellij-cwd-plugin"
+name = "zellij-tab-rename"
 version = "0.1.0"
 dependencies = [
  "zellij-tile",
