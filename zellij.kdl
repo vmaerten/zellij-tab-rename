@@ -6,7 +6,7 @@ layout {
         }
     }
     pane size=1 borderless=true {
-        plugin location="file:target/wasm32-wasip1/debug/zellij_cwd_plugin.wasm" {
+        plugin location="file:target/wasm32-wasip1/debug/zellij-tab-rename.wasm" {
             // source "cwd"          // "cwd" or "process"
             // format "basename"     // "basename", "full", "tilde", "segments:2"
             // max_length "25"
