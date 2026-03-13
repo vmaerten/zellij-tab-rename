@@ -27,6 +27,10 @@ pub(crate) struct RenameState {
     pub pending_git_lookups: HashMap<PathBuf, Vec<usize>>,
     /// Terminal pane count per tab
     pub pane_counts: HashMap<usize, usize>,
+    /// Set of known git root paths for O(1) ancestor lookups
+    pub known_git_roots: HashSet<PathBuf>,
+    /// Structural fingerprint: (tab_count, total_pane_count) for fast-path detection
+    pub last_structure: (usize, usize),
 }
 
 impl super::State {
@@ -70,89 +74,150 @@ impl super::State {
     }
 
     pub(crate) fn handle_pane_update(&mut self, manifest: PaneManifest) {
-        let mut seen_panes: HashSet<PaneId> = HashSet::new();
+        let tab_count = manifest.panes.len();
+        let total_panes: usize = manifest.panes.values().map(|p| p.len()).sum();
+        let structure = (tab_count, total_panes);
+        let structure_changed = structure != self.rename.last_structure;
+        self.rename.last_structure = structure;
+
         let mut tabs_to_rename: HashSet<usize> = HashSet::new();
 
-        for (tab_index, panes) in &manifest.panes {
-            for pane in panes {
-                let pane_id = if pane.is_plugin {
-                    PaneId::Plugin(pane.id)
-                } else {
-                    PaneId::Terminal(pane.id)
-                };
+        if structure_changed {
+            // Full path: panes were added/removed/moved — do all bookkeeping
+            let mut seen_panes: HashSet<PaneId> = HashSet::new();
 
-                seen_panes.insert(pane_id);
-
-                let pane_state = self.rename.pane_info.entry(pane_id).or_default();
-
-                if pane_state.tab_index != *tab_index {
-                    pane_state.tab_index = *tab_index;
-                }
-                if pane_state.title != pane.title {
-                    pane_state.title.clone_from(&pane.title);
-                }
-
-                if let Some(pending_cwd) = self.rename.pending_cwds.remove(&pane_id) {
-                    pane_state.cwd = pending_cwd;
-                    if pane.is_focused && !pane.is_plugin {
-                        tabs_to_rename.insert(*tab_index);
-                    }
-                }
-
-                if pane.is_focused && !pane.is_plugin && pane_state.cwd.as_os_str().is_empty() {
-                    match get_pane_cwd(pane_id) {
-                        Ok(cwd) if !cwd.as_os_str().is_empty() => {
-                            pane_state.cwd = cwd;
-                        }
-                        _ => {}
-                    }
-                }
-
-                if pane.is_focused && !pane.is_plugin {
-                    let prev_focused =
-                        self.rename.focused_panes.insert(*tab_index, pane_id);
-
-                    if prev_focused != Some(pane_id) {
-                        tabs_to_rename.insert(*tab_index);
-                    } else if !pane_state.cwd.as_os_str().is_empty()
-                        && !self.current_tab_names.contains_key(tab_index)
-                    {
-                        tabs_to_rename.insert(*tab_index);
-                    }
-                }
-            }
-        }
-
-        self.rename.pane_info.retain(|id, _| seen_panes.contains(id));
-
-        // Recompute terminal pane counts per tab
-        if !self.config.pane_count.is_empty() {
-            let mut new_counts: HashMap<usize, usize> = HashMap::new();
             for (tab_index, panes) in &manifest.panes {
-                let count = panes.iter().filter(|p| !p.is_plugin).count();
-                new_counts.insert(*tab_index, count);
-            }
-            for (tab_index, &new_count) in &new_counts {
-                let old_count = self.rename.pane_counts.get(tab_index).copied();
-                if old_count != Some(new_count) {
-                    tabs_to_rename.insert(*tab_index);
-                }
-            }
-            self.rename.pane_counts = new_counts;
-        }
+                for pane in panes {
+                    let pane_id = if pane.is_plugin {
+                        PaneId::Plugin(pane.id)
+                    } else {
+                        PaneId::Terminal(pane.id)
+                    };
 
-        // Clean up decorations whose source pane is gone
-        self.decorations
-            .tab_decoration_source
-            .retain(|tab_idx, source_pane| {
-                if seen_panes.contains(source_pane) {
-                    true
-                } else {
-                    self.decorations.tab_decorations.remove(tab_idx);
-                    tabs_to_rename.insert(*tab_idx);
-                    false
+                    seen_panes.insert(pane_id);
+                    let is_new = !self.rename.pane_info.contains_key(&pane_id);
+                    let pane_state = self.rename.pane_info.entry(pane_id).or_default();
+
+                    if pane_state.tab_index != *tab_index {
+                        pane_state.tab_index = *tab_index;
+                    }
+                    if pane_state.title != pane.title {
+                        pane_state.title.clone_from(&pane.title);
+                    }
+
+                    if let Some(pending_cwd) = self.rename.pending_cwds.remove(&pane_id) {
+                        pane_state.cwd = pending_cwd;
+                        if pane.is_focused && !pane.is_plugin {
+                            tabs_to_rename.insert(*tab_index);
+                        }
+                    }
+
+                    if is_new
+                        && pane.is_focused
+                        && !pane.is_plugin
+                        && pane_state.cwd.as_os_str().is_empty()
+                    {
+                        match get_pane_cwd(pane_id) {
+                            Ok(cwd) if !cwd.as_os_str().is_empty() => {
+                                pane_state.cwd = cwd;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if pane.is_focused && !pane.is_plugin {
+                        let prev_focused =
+                            self.rename.focused_panes.insert(*tab_index, pane_id);
+
+                        if prev_focused != Some(pane_id) {
+                            tabs_to_rename.insert(*tab_index);
+                        } else if !pane_state.cwd.as_os_str().is_empty()
+                            && !self.current_tab_names.contains_key(tab_index)
+                        {
+                            tabs_to_rename.insert(*tab_index);
+                        }
+                    }
                 }
-            });
+            }
+
+            self.rename
+                .pane_info
+                .retain(|id, _| seen_panes.contains(id));
+
+            // Recompute terminal pane counts per tab (only on structural change)
+            if !self.config.pane_count.is_empty() {
+                let mut new_counts: HashMap<usize, usize> = HashMap::new();
+                for (tab_index, panes) in &manifest.panes {
+                    let count = panes.iter().filter(|p| !p.is_plugin).count();
+                    new_counts.insert(*tab_index, count);
+                }
+                for (tab_index, &new_count) in &new_counts {
+                    let old_count = self.rename.pane_counts.get(tab_index).copied();
+                    if old_count != Some(new_count) {
+                        tabs_to_rename.insert(*tab_index);
+                    }
+                }
+                self.rename.pane_counts = new_counts;
+            }
+
+            // Clean up decorations whose source pane is gone
+            self.decorations
+                .tab_decoration_source
+                .retain(|tab_idx, source_pane| {
+                    if seen_panes.contains(source_pane) {
+                        true
+                    } else {
+                        self.decorations.tab_decorations.remove(tab_idx);
+                        tabs_to_rename.insert(*tab_idx);
+                        false
+                    }
+                });
+        } else {
+            // Fast path: structure unchanged — only check focus changes and pending CWDs
+            for (tab_index, panes) in &manifest.panes {
+                for pane in panes {
+                    if pane.is_plugin {
+                        continue;
+                    }
+
+                    let pane_id = PaneId::Terminal(pane.id);
+
+                    // Drain any pending CWDs even on fast path
+                    if let Some(pending_cwd) = self.rename.pending_cwds.remove(&pane_id) {
+                        if let Some(pane_state) = self.rename.pane_info.get_mut(&pane_id) {
+                            pane_state.cwd = pending_cwd;
+                            if pane.is_focused {
+                                tabs_to_rename.insert(*tab_index);
+                            }
+                        }
+                    }
+
+                    // Update title if changed
+                    if let Some(pane_state) = self.rename.pane_info.get_mut(&pane_id) {
+                        if pane_state.title != pane.title {
+                            pane_state.title.clone_from(&pane.title);
+                        }
+                    }
+
+                    if pane.is_focused {
+                        let prev_focused =
+                            self.rename.focused_panes.insert(*tab_index, pane_id);
+
+                        if prev_focused != Some(pane_id) {
+                            tabs_to_rename.insert(*tab_index);
+                        } else if self
+                            .rename
+                            .pane_info
+                            .get(&pane_id)
+                            .is_some_and(|ps| !ps.cwd.as_os_str().is_empty())
+                            && !self.current_tab_names.contains_key(tab_index)
+                        {
+                            tabs_to_rename.insert(*tab_index);
+                        }
+                    }
+                }
+            }
+        }
 
         for tab_index in tabs_to_rename {
             if let Some(&pane_id) = self.rename.focused_panes.get(&tab_index) {
@@ -183,6 +248,9 @@ impl super::State {
             None
         };
 
+        if let Some(ref root) = git_root {
+            self.rename.known_git_roots.insert(root.clone());
+        }
         self.rename.git_root_cache.insert(cwd.clone(), git_root);
 
         if let Some(tab_indices) = self.rename.pending_git_lookups.remove(&cwd) {
@@ -207,23 +275,15 @@ impl super::State {
             return Some(cached.clone());
         }
 
-        // Check if an ancestor's git root covers this path
-        let mut best_match: Option<PathBuf> = None;
-        for cached_root in self.rename.git_root_cache.values().flatten() {
-            if cwd.starts_with(cached_root) {
-                if best_match
-                    .as_ref()
-                    .is_none_or(|prev| cached_root.as_os_str().len() > prev.as_os_str().len())
-                {
-                    best_match = Some(cached_root.clone());
-                }
+        // Walk up ancestors to find a known git root — O(path_depth) instead of O(cache_size)
+        for ancestor in cwd.ancestors().skip(1) {
+            if self.rename.known_git_roots.contains(ancestor) {
+                let root = ancestor.to_path_buf();
+                self.rename
+                    .git_root_cache
+                    .insert(cwd.to_path_buf(), Some(root.clone()));
+                return Some(Some(root));
             }
-        }
-        if let Some(root) = best_match {
-            self.rename
-                .git_root_cache
-                .insert(cwd.to_path_buf(), Some(root.clone()));
-            return Some(Some(root));
         }
 
         // Cache miss: register this tab as waiting
@@ -340,6 +400,9 @@ mod tests {
     ) -> super::super::State {
         let mut state = make_state_with_config(config);
         for (path, root) in cache {
+            if let Some(ref r) = root {
+                state.rename.known_git_roots.insert(r.clone());
+            }
             state.rename.git_root_cache.insert(path, root);
         }
         state
