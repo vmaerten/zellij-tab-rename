@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use zellij_tile::prelude::*;
 
+use crate::debug_log;
+
 #[derive(Default, Clone, Debug, PartialEq)]
 pub(crate) struct Decorations {
     pub prefix: String,
@@ -34,7 +36,7 @@ impl super::State {
                         .map(|ps| (ps.tab_index, Some(pane_id)))
                 }
                 Err(_) => {
-                    eprintln!("[cwd-plugin] pipe: invalid pane id \"{}\"", pane_str);
+                    debug_log!("[cwd-plugin] pipe: invalid pane id \"{}\"", pane_str);
                     return true;
                 }
             }
@@ -44,7 +46,7 @@ impl super::State {
             self.clear_all_decorations();
             return true;
         } else {
-            eprintln!(
+            debug_log!(
                 "[cwd-plugin] pipe: no pane or tab specified for \"{}\"",
                 action
             );
@@ -52,7 +54,7 @@ impl super::State {
         };
 
         let Some((tab_idx, pane_id)) = tab_index else {
-            eprintln!(
+            debug_log!(
                 "[cwd-plugin] pipe: could not resolve tab for args {:?}, known panes: {:?}",
                 msg.args,
                 self.rename.pane_info.keys().collect::<Vec<_>>()

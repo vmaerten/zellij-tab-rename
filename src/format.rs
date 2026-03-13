@@ -7,6 +7,7 @@ pub(crate) fn compose_tab_name(
     base: &str,
     config_prefix: &str,
     config_suffix: &str,
+    pane_count_suffix: &str,
     deco: Option<&Decorations>,
     max_length: usize,
     truncate_side: &TruncateSide,
@@ -18,17 +19,20 @@ pub(crate) fn compose_tab_name(
         format!("{}{}{}", config_prefix, base, config_suffix)
     };
 
-    // Truncate the config-wrapped name (before decoration)
+    // Truncate the config-wrapped name (before decoration and pane count)
     let truncated = truncate_name(&with_config, max_length, truncate_side);
 
-    // Wrap with decorations
+    // Wrap with pane count suffix and decorations
     let deco_prefix = deco.map(|d| d.prefix.as_str()).unwrap_or("");
     let deco_suffix = deco.map(|d| d.suffix.as_str()).unwrap_or("");
 
-    if deco_prefix.is_empty() && deco_suffix.is_empty() {
+    if deco_prefix.is_empty() && deco_suffix.is_empty() && pane_count_suffix.is_empty() {
         truncated
     } else {
-        format!("{}{}{}", deco_prefix, truncated, deco_suffix)
+        format!(
+            "{}{}{}{}",
+            deco_prefix, truncated, pane_count_suffix, deco_suffix
+        )
     }
 }
 
@@ -101,13 +105,13 @@ mod tests {
 
     #[test]
     fn test_compose_plain() {
-        let result = compose_tab_name("myapp", "", "", None, 0, &TruncateSide::Right);
+        let result = compose_tab_name("myapp", "", "", "", None, 0, &TruncateSide::Right);
         assert_eq!(result, "myapp");
     }
 
     #[test]
     fn test_compose_with_config_prefix_suffix() {
-        let result = compose_tab_name("myapp", "[", "]", None, 0, &TruncateSide::Right);
+        let result = compose_tab_name("myapp", "[", "]", "", None, 0, &TruncateSide::Right);
         assert_eq!(result, "[myapp]");
     }
 
@@ -117,7 +121,7 @@ mod tests {
             prefix: "🔨 ".to_string(),
             suffix: String::new(),
         };
-        let result = compose_tab_name("myapp", "", "", Some(&deco), 0, &TruncateSide::Right);
+        let result = compose_tab_name("myapp", "", "", "", Some(&deco), 0, &TruncateSide::Right);
         assert_eq!(result, "🔨 myapp");
     }
 
@@ -127,7 +131,7 @@ mod tests {
             prefix: "🔨 ".to_string(),
             suffix: " ✓".to_string(),
         };
-        let result = compose_tab_name("myapp", "[", "]", Some(&deco), 0, &TruncateSide::Right);
+        let result = compose_tab_name("myapp", "[", "]", "", Some(&deco), 0, &TruncateSide::Right);
         assert_eq!(result, "🔨 [myapp] ✓");
     }
 
@@ -137,7 +141,7 @@ mod tests {
             prefix: "🔨 ".to_string(),
             suffix: String::new(),
         };
-        let result = compose_tab_name("myapp", "[", "]", Some(&deco), 10, &TruncateSide::Right);
+        let result = compose_tab_name("myapp", "[", "]", "", Some(&deco), 10, &TruncateSide::Right);
         assert_eq!(result, "🔨 [myapp]");
     }
 
@@ -151,6 +155,7 @@ mod tests {
             "very-long-name",
             "[",
             "]",
+            "",
             Some(&deco),
             10,
             &TruncateSide::Right,
@@ -164,7 +169,31 @@ mod tests {
             prefix: String::new(),
             suffix: String::new(),
         };
-        let result = compose_tab_name("myapp", "", "", Some(&deco), 0, &TruncateSide::Right);
+        let result = compose_tab_name("myapp", "", "", "", Some(&deco), 0, &TruncateSide::Right);
         assert_eq!(result, "myapp");
+    }
+
+    #[test]
+    fn test_compose_with_pane_count() {
+        let result = compose_tab_name("myapp", "", "", " (3)", None, 0, &TruncateSide::Right);
+        assert_eq!(result, "myapp (3)");
+    }
+
+    #[test]
+    fn test_compose_pane_count_with_decorations() {
+        let deco = Decorations {
+            prefix: "🔨 ".to_string(),
+            suffix: " ✓".to_string(),
+        };
+        let result =
+            compose_tab_name("myapp", "", "", " (2)", Some(&deco), 0, &TruncateSide::Right);
+        assert_eq!(result, "🔨 myapp (2) ✓");
+    }
+
+    #[test]
+    fn test_compose_pane_count_after_truncation() {
+        let result =
+            compose_tab_name("very-long-name", "", "", " (3)", None, 10, &TruncateSide::Right);
+        assert_eq!(result, "very-lo... (3)");
     }
 }

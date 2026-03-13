@@ -6,6 +6,14 @@ mod rename;
 use std::collections::{BTreeMap, HashMap};
 use zellij_tile::prelude::*;
 
+#[macro_export]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        eprintln!($($arg)*);
+    };
+}
+
 use config::{Config, Source};
 use decorations::DecorationState;
 use format::compose_tab_name;
@@ -54,11 +62,11 @@ impl ZellijPlugin for State {
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::PermissionRequestResult(result) => {
-                eprintln!("[cwd-plugin] PermissionRequestResult: {:?}", result);
+                debug_log!("[cwd-plugin] PermissionRequestResult: {:?}", result);
                 if result == PermissionStatus::Granted {
                     self.got_permissions = true;
                     let buffered = std::mem::take(&mut self.buffered_events);
-                    eprintln!("[cwd-plugin] replaying {} buffered events", buffered.len());
+                    debug_log!("[cwd-plugin] replaying {} buffered events", buffered.len());
                     for ev in buffered {
                         self.process_event(ev);
                     }
@@ -68,7 +76,7 @@ impl ZellijPlugin for State {
                 if self.got_permissions {
                     self.process_event(event);
                 } else {
-                    eprintln!("[cwd-plugin] permissions pending, buffering event");
+                    debug_log!("[cwd-plugin] permissions pending, buffering event");
                     self.buffered_events.push(event);
                 }
             }
@@ -77,9 +85,9 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
-        eprintln!(
-            "[cwd-plugin] pipe: name={}, args={:?}, payload={:?}",
-            pipe_message.name, pipe_message.args, pipe_message.payload
+        debug_log!(
+            "[cwd-plugin] pipe: name={}, args={:?}",
+            pipe_message.name, pipe_message.args
         );
         let cli_pipe_id = match &pipe_message.source {
             PipeSource::Cli(id) => Some(id.clone()),
@@ -99,7 +107,7 @@ impl State {
     fn process_event(&mut self, event: Event) {
         match event {
             Event::CwdChanged(pane_id, cwd, _) => {
-                eprintln!(
+                debug_log!(
                     "[cwd-plugin] event: CwdChanged pane={:?} cwd={}",
                     pane_id,
                     cwd.display()
@@ -107,18 +115,13 @@ impl State {
                 self.handle_cwd_changed(pane_id, cwd);
             }
             Event::TabUpdate(tabs) => {
-                eprintln!("[cwd-plugin] event: TabUpdate ({} tabs)", tabs.len());
                 self.handle_tab_update(&tabs);
             }
             Event::PaneUpdate(manifest) => {
-                eprintln!(
-                    "[cwd-plugin] event: PaneUpdate ({} tabs)",
-                    manifest.panes.len()
-                );
                 self.handle_pane_update(manifest);
             }
             Event::RunCommandResult(exit_code, stdout, _stderr, context) => {
-                eprintln!("[cwd-plugin] event: RunCommandResult exit={:?}", exit_code);
+                debug_log!("[cwd-plugin] event: RunCommandResult exit={:?}", exit_code);
                 self.handle_run_command_result(exit_code, stdout, context);
             }
             _ => {}
@@ -145,11 +148,25 @@ impl State {
             return;
         }
 
+        let pane_count_suffix = if !self.config.pane_count.is_empty() {
+            let count = self.rename.pane_counts.get(&tab_index).copied().unwrap_or(1);
+            if count >= self.config.pane_count_min {
+                self.config
+                    .pane_count
+                    .replace("{count}", &count.to_string())
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
         let deco = self.decorations.tab_decorations.get(&tab_index);
         let final_name = compose_tab_name(
             &name,
             &self.config.prefix,
             &self.config.suffix,
+            &pane_count_suffix,
             deco,
             self.config.max_length,
             &self.config.truncate_side,
@@ -164,7 +181,7 @@ impl State {
             .is_none_or(|current| current != new_name);
 
         if should_rename && !new_name.is_empty() {
-            eprintln!(
+            debug_log!(
                 "[cwd-plugin] renaming tab {} -> \"{}\"",
                 tab_position, new_name
             );
@@ -172,7 +189,7 @@ impl State {
             self.current_tab_names
                 .insert(tab_position, new_name.to_string());
         } else if !should_rename {
-            eprintln!(
+            debug_log!(
                 "[cwd-plugin] tab {} skip (already \"{}\")",
                 tab_position, new_name
             );
